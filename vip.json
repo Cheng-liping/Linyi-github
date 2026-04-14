@@ -1,8 +1,15 @@
 {
   "vip": [
     {
-      "oWI2S5cMWSe75NNv6wHU_UxvWNjd": ""
+      "oPbih5zPFZcOQOYly54hjqC357wM": ""
+    },
+    {
+      "oWI2S5cMWSe75zzz6wHU_UxvWNdE": "1778776191780"
     }
   ],
-  "admin": []
+  "admin": [
+    {
+      "openid": "oPbih5zPFZcOQOYly54hjqC357wM"
+    }
+  ]
 }
