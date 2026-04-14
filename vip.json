@@ -1,8 +1,8 @@
 {
-  "vip": [],
-  "admin": [
+  "vip": [
     {
-      "openid": "oWI2S5cMWSe75NNv6wHU_UxvWNdE"
+      "oWI2S5cMWSe75NNv6wHU_UxvWNjd": ""
     }
-  ]
+  ],
+  "admin": []
 }
