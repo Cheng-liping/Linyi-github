@@ -409,8 +409,8 @@ static BOOL _quarkd_in_outgoing = NO;            // 发件hook标识
         quarkd_log(@"✅ 白名单通过, 处理命令: %@", content);
 
         // /s 搜索
-        if ([content hasPrefix:@"/s "] || [content hasPrefix:@"/search "]) {
-            NSString *keyword = [[content substringFromIndex:[content hasPrefix:@"/s "] ? 3 : 8]
+        if ([content hasPrefix:@"/s "]) {
+            NSString *keyword = [[content substringFromIndex:3]
                                  stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
             if (keyword.length == 0) return;
 
@@ -429,12 +429,9 @@ static BOOL _quarkd_in_outgoing = NO;            // 发件hook标识
             lastKeyword()[fromUser] = keyword;
 
             NSMutableString *reply = [NSMutableString string];
-            [reply appendString:@"━━ 搜索结果 ━━\n"];
             for (NSInteger i = 0; i < MIN(results.count, 10); i++) {
                 [reply appendFormat:@"[%ld] %@\n", (long)i, [results[i] title]];
             }
-            if (results.count > 10) [reply appendFormat:@"... 还有 %ld 条\n", (long)(results.count - 10)];
-            [reply appendString:@"━━━━━━━━━━\n回复 /g 序号 获取链接"];
             [self quarkd_doSendText:reply toUser:fromUser];
             return;
         }
@@ -461,29 +458,7 @@ static BOOL _quarkd_in_outgoing = NO;            // 发件hook标识
             }
             return;
         }
-        if ([content hasPrefix:@"/g "] || [content hasPrefix:@"/get "]) {
-            NSString *arg = [[content substringFromIndex:3]
-                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-            if (arg.length == 0) { [self quarkd_doSendText:@"⚠️ 用法: /g 序号" toUser:fromUser]; return; }
 
-            NSString *kw = lastKeyword()[fromUser];
-            NSDictionary *userCache = searchCache()[fromUser];
-            NSArray *cached = userCache ? userCache[kw] : nil;
-            if (!cached || cached.count == 0) {
-                return;
-            }
-
-            NSDictionary *target = nil;
-            if ([arg rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
-                NSInteger idx = arg.integerValue;
-                if (idx >= 0 && idx < (NSInteger)cached.count) {
-                    target = cached[idx];
-                }
-            } else {
-                for (NSDictionary *d in cached) {
-                    if ([d[@"title"] containsString:arg]) { target = d; break; }
-                }
-            }
 
             if (!target) { [self quarkd_doSendText:@"序号无效" toUser:fromUser]; return; }
 
