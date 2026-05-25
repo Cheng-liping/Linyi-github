@@ -1,0 +1,909 @@
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import "QuarkAPI.h"
+
+// ═══════════════════════════════════════════════════════
+//  夸克搜索助手 — 签名注入版（非越狱）
+//  纯 ObjC Runtime Swizzling，无 MobileSubstrate 依赖
+//  日志写入文件: Documents/quarkd.log
+// ═══════════════════════════════════════════════════════
+
+// ── 文件日志系统 ─────────────────────────────────────
+
+static NSString *quarkd_logPath(void) {
+    static NSString *path = nil;
+    if (!path) {
+        NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        path = [[dirs firstObject] stringByAppendingPathComponent:@"quarkd.log"];
+    }
+    return path;
+}
+
+static void quarkd_log(NSString *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+
+    NSLog(@"[quarkd] %@", msg);
+
+    NSString *line = [NSString stringWithFormat:@"%@ [quarkd] %@\n",
+                      [[NSDate date] descriptionWithLocale:[NSLocale currentLocale]], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:quarkd_logPath()];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:quarkd_logPath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+static NSString *quarkd_readLog(NSInteger maxLines) {
+    NSString *content = [NSString stringWithContentsOfFile:quarkd_logPath() encoding:NSUTF8StringEncoding error:nil];
+    if (!content || content.length == 0) return @"日志为空";
+    NSArray *lines = [content componentsSeparatedByString:@"\n"];
+    if (maxLines > 0 && lines.count > maxLines) {
+        lines = [lines subarrayWithRange:NSMakeRange(lines.count - maxLines, maxLines)];
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
+
+// ── NSUserDefaults keys ──────────────────────────────
+
+static NSString * const kUDCookie    = @"quarkd_cookie";
+static NSString * const kUDWhitelist = @"quarkd_whitelist";
+
+static NSString *quarkd_cookie(void) {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kUDCookie] ?: @"";
+}
+static void quarkd_setCookie(NSString *c) {
+    [[NSUserDefaults standardUserDefaults] setObject:c forKey:kUDCookie];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+static NSMutableArray<NSString *> *quarkd_whitelist(void) {
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kUDWhitelist];
+    return a ? [a mutableCopy] : [NSMutableArray array];
+}
+static void quarkd_saveWhitelist(NSArray<NSString *> *list) {
+    [[NSUserDefaults standardUserDefaults] setObject:list forKey:kUDWhitelist];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+static BOOL quarkd_isUserAllowed(NSString *wxid) {
+    NSArray *wl = [[NSUserDefaults standardUserDefaults] arrayForKey:kUDWhitelist];
+    if (!wl || wl.count == 0) return NO;
+    return [wl containsObject:wxid];
+}
+
+// ── 搜索缓存 ─────────────────────────────────────────
+
+static NSMutableDictionary *_searchCache;
+static NSMutableDictionary *_lastKeyword;
+static NSMutableDictionary *searchCache(void) {
+    if (!_searchCache) _searchCache = [NSMutableDictionary dictionary];
+    return _searchCache;
+}
+static NSMutableDictionary *lastKeyword(void) {
+    if (!_lastKeyword) _lastKeyword = [NSMutableDictionary dictionary];
+    return _lastKeyword;
+}
+
+
+// ═══════════════════════════════════════════════════════
+//  Swizzle 工具
+// ═══════════════════════════════════════════════════════
+
+static void swizzle(Class cls, SEL orig, SEL replacement) {
+    Method m1 = class_getInstanceMethod(cls, orig);
+    Method m2 = class_getInstanceMethod(cls, replacement);
+    if (m1 && m2) {
+        method_exchangeImplementations(m1, m2);
+        quarkd_log(@"✅ swizzled %@ %@", cls, NSStringFromSelector(orig));
+    } else {
+        quarkd_log(@"❌ swizzle failed: %@ %@ (m1=%p m2=%p)", cls, NSStringFromSelector(orig), m1, m2);
+    }
+}
+
+static void swizzleOrAdd(Class cls, SEL orig, SEL replacement) {
+    Method m2 = class_getInstanceMethod(cls, replacement);
+    if (!m2) { quarkd_log(@"❌ replacement method not found for %@ %@", cls, NSStringFromSelector(orig)); return; }
+    IMP imp = method_getImplementation(m2);
+    const char *types = method_getTypeEncoding(m2);
+    if (class_addMethod(cls, orig, imp, types)) {
+        quarkd_log(@"✅ added %@ %@", cls, NSStringFromSelector(orig));
+    } else {
+        swizzle(cls, orig, replacement);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════
+//  发送消息
+// ═══════════════════════════════════════════════════════
+
+@interface NSObject (QuarkdSend)
+- (void)quarkd_doSendText:(NSString *)text toUser:(NSString *)user;
+@end
+
+@implementation NSObject (QuarkdSend)
+
+- (void)quarkd_doSendText:(NSString *)text toUser:(NSString *)user {
+    quarkd_log(@"📤 sendText to %@: %@", user, text);
+
+    Class wrapCls = NSClassFromString(@"CMessageWrap");
+    if (!wrapCls) { quarkd_log(@"❌ CMessageWrap not found"); return; }
+
+    id wrap = [[wrapCls alloc] init];
+    [wrap setValue:user forKey:@"m_nsToUsr"];
+    [wrap setValue:text forKey:@"m_nsContent"];
+    [wrap setValue:@(1) forKey:@"m_uiMessageType"];
+
+    id msgMgr = [self _quarkd_getMsgMgr];
+    if (msgMgr) {
+        SEL addMsg = NSSelectorFromString(@"AddMsg:MsgWrap:");
+        if ([msgMgr respondsToSelector:addMsg]) {
+            [msgMgr performSelector:addMsg withObject:user withObject:wrap];
+            quarkd_log(@"✅ 消息已发送 via AddMsg:MsgWrap:");
+            return;
+        }
+    }
+    quarkd_log(@"❌ 发送消息失败");
+}
+
+- (id)_quarkd_getMsgMgr {
+    Class center = NSClassFromString(@"MMServiceCenter");
+    if (!center) return nil;
+    NSArray *names = @[@"CMessageMgr", @"CMMessageManager", @"MMessageMgr"];
+    for (NSString *n in names) {
+        Class c = NSClassFromString(n);
+        if (!c) continue;
+        id mgr = [[center defaultCenter] performSelector:NSSelectorFromString(@"getService:") withObject:c];
+        if (mgr) return mgr;
+    }
+    return nil;
+}
+
+@end
+
+
+// ═══════════════════════════════════════════════════════
+//  消息拦截
+// ═══════════════════════════════════════════════════════
+
+@interface NSObject (QuarkdMsg)
+- (void)quarkd_onNewSyncMessage:(id)msg;
+- (void)quarkd_viewDidLoad;
+- (void)quarkd_openSettings;
+@end
+
+@implementation NSObject (QuarkdMsg)
+
+- (void)quarkd_onNewSyncMessage:(id)msg {
+    // 先调原方法
+    if ([self respondsToSelector:@selector(quarkd_onNewSyncMessage:)]) {
+        [self quarkd_onNewSyncMessage:msg];
+    }
+
+    @try {
+        NSString *content = [msg valueForKey:@"m_nsContent"];
+        NSString *fromUser = [msg valueForKey:@"m_nsFromUsr"];
+
+        // 详细日志：每条消息都记录
+        NSString *preview = content.length > 50 ? [[content substringToIndex:50] stringByAppendingString:@"..."] : content;
+        quarkd_log(@"📩 收到消息 from=%@ content=\"%@\"", fromUser ?: @"(nil)", preview ?: @"(nil)");
+
+        if (!content || !fromUser || content.length == 0) {
+            quarkd_log(@"⚠️ 空消息或空发送者，跳过");
+            return;
+        }
+
+        // 白名单检查
+        NSArray *wl = [[NSUserDefaults standardUserDefaults] arrayForKey:kUDWhitelist];
+        quarkd_log(@"🔍 白名单检查: user=%@, wl_count=%lu", fromUser, (unsigned long)(wl ? wl.count : 0));
+
+        if (!quarkd_isUserAllowed(fromUser)) {
+            quarkd_log(@"⛔ %@ 不在白名单，忽略", fromUser);
+            return;
+        }
+
+        content = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        quarkd_log(@"✅ 白名单通过, 处理: %@", content);
+
+        // /debug
+        if ([content isEqualToString:@"/debug"] || [content isEqualToString:@"/d"]) {
+            NSString *info = [self _quarkd_debugInfo];
+            // 分段发送
+            NSArray *chunks = [self _quarkd_chunkString:info size:400];
+            for (NSString *c in chunks) {
+                [self quarkd_doSendText:c toUser:fromUser];
+                [NSThread sleepForTimeInterval:0.3];
+            }
+            return;
+        }
+
+        // /log
+        if ([content hasPrefix:@"/log"]) {
+            NSInteger n = 50;
+            NSString *rest = [[content substringFromIndex:4] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (rest.length > 0) n = rest.integerValue;
+            if (n <= 0) n = 50;
+            NSString *logText = quarkd_readLog(n);
+            NSArray *chunks = [self _quarkd_chunkString:logText size:400];
+            for (NSString *c in chunks) {
+                [self quarkd_doSendText:c toUser:fromUser];
+                [NSThread sleepForTimeInterval:0.3];
+            }
+            return;
+        }
+
+        // /ck
+        if ([content hasPrefix:@"/ck "] || [content hasPrefix:@"/cookie "]) {
+            NSString *newCookie = [content substringFromIndex:[content hasPrefix:@"/ck "] ? 4 : 8];
+            quarkd_setCookie(newCookie);
+            quarkd_log(@"🍪 Cookie 更新, len=%lu", (unsigned long)newCookie.length);
+            [self quarkd_doSendText:@"✅ Cookie 已更新" toUser:fromUser];
+            return;
+        }
+
+        // /s 搜索
+        if ([content hasPrefix:@"/s "] || [content hasPrefix:@"/search "]) {
+            NSString *keyword = [[content substringFromIndex:[content hasPrefix:@"/s "] ? 3 : 8]
+                                 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (keyword.length == 0) { [self quarkd_doSendText:@"用法: /s 关键词" toUser:fromUser]; return; }
+
+            quarkd_log(@"🔍 搜索: %@", keyword);
+            [self quarkd_doSendText:[NSString stringWithFormat:@"🔍 搜索中: %@...", keyword] toUser:fromUser];
+
+            NSArray *results = [QuarkAPI search:keyword];
+            quarkd_log(@"📊 搜索结果: %lu 条", (unsigned long)results.count);
+
+            if (results.count == 0) {
+                [self quarkd_doSendText:[NSString stringWithFormat:@"未找到「%@」相关资源", keyword] toUser:fromUser];
+                return;
+            }
+
+            NSMutableArray *cached = [NSMutableArray array];
+            for (QuarkResult *r in results) {
+                [cached addObject:@{@"title": r.title, @"url": r.url, @"rid": @(r.rid)}];
+            }
+            searchCache()[fromUser] = @{keyword: cached};
+            lastKeyword()[fromUser] = keyword;
+
+            NSMutableString *reply = [NSMutableString string];
+            [reply appendString:@"━━ 搜索结果 ━━\n"];
+            for (QuarkResult *r in results) {
+                [reply appendFormat:@"[%ld] %@\n", (long)r.rid, r.title];
+            }
+            [reply appendString:@"━━━━━━━━━━\n回复 /g 序号 一键转存"];
+            [self quarkd_doSendText:reply toUser:fromUser];
+            return;
+        }
+
+        // /g 转存
+        if ([content hasPrefix:@"/g "] || [content hasPrefix:@"/get "]) {
+            NSString *arg = [[content substringFromIndex:3]
+                             stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (arg.length == 0) { [self quarkd_doSendText:@"用法: /g 序号" toUser:fromUser]; return; }
+
+            NSString *kw = lastKeyword()[fromUser];
+            NSDictionary *userCache = searchCache()[fromUser];
+            NSArray *cached = userCache ? userCache[kw] : nil;
+            if (!cached || cached.count == 0) {
+                [self quarkd_doSendText:@"请先搜索: /s 关键词" toUser:fromUser];
+                return;
+            }
+
+            NSDictionary *target = nil;
+            if ([arg rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
+                NSInteger idx = arg.integerValue;
+                for (NSDictionary *d in cached) {
+                    if ([d[@"rid"] integerValue] == idx) { target = d; break; }
+                }
+            } else {
+                for (NSDictionary *d in cached) {
+                    if ([d[@"title"] containsString:arg]) { target = d; break; }
+                }
+            }
+
+            if (!target) {
+                [self quarkd_doSendText:@"未找到匹配资源，请检查序号" toUser:fromUser];
+                return;
+            }
+
+            quarkd_log(@"⏳ 转存: %@", target[@"title"]);
+            [self quarkd_doSendText:[NSString stringWithFormat:@"⏳ 转存中: %@...", target[@"title"]] toUser:fromUser];
+
+            NSString *cookie = quarkd_cookie();
+            NSString *url = target[@"url"];
+            NSString *u = fromUser;
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                NSString *result = [QuarkAPI transfer:url cookie:cookie];
+                quarkd_log(@"📥 转存结果: %@", result);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self quarkd_doSendText:result toUser:u];
+                });
+            });
+            return;
+        }
+
+        // /help
+        if ([content isEqualToString:@"/help"] || [content isEqualToString:@"/h"]) {
+            [self quarkd_doSendText:@"📖 命令:\n"
+             "/s 关键词 — 搜索资源\n"
+             "/g 序号 — 一键转存\n"
+             "/ck xxx — 更新Cookie\n"
+             "/list — 查看白名单\n"
+             "/log [N] — 查看日志(默认50行)\n"
+             "/debug — 诊断信息\n"
+             "/help — 帮助" toUser:fromUser];
+            return;
+        }
+
+        // /list
+        if ([content isEqualToString:@"/list"]) {
+            NSArray *wll = quarkd_whitelist();
+            if (wll.count == 0) {
+                [self quarkd_doSendText:@"白名单为空\n请去 微信设置→右上角「夸克」→添加授权联系人" toUser:fromUser];
+            } else {
+                NSMutableString *s = [NSMutableString stringWithString:@"📋 授权用户:\n"];
+                for (NSString *wxid in wll) { [s appendFormat:@"• %@\n", wxid]; }
+                [self quarkd_doSendText:s toUser:fromUser];
+            }
+            return;
+        }
+
+    } @catch (NSException *e) {
+        quarkd_log(@"❌ onNewSyncMessage 异常: %@", e);
+    }
+}
+
+- (NSArray *)_quarkd_chunkString:(NSString *)str size:(NSInteger)sz {
+    NSMutableArray *chunks = [NSMutableArray array];
+    for (NSInteger i = 0; i < str.length; i += sz) {
+        NSInteger len = MIN(sz, str.length - i);
+        [chunks addObject:[str substringWithRange:NSMakeRange(i, len)]];
+    }
+    return chunks;
+}
+
+- (NSString *)_quarkd_debugInfo {
+    NSMutableString *s = [NSMutableString string];
+    [s appendString:@"🔧 诊断信息:\n\n=== 类可用性 ===\n"];
+    NSArray *classes = @[@"CMessageMgr", @"CMessageWrap", @"MMServiceCenter",
+                          @"NewSettingViewController", @"MMSessionMgr",
+                          @"MMNewSessionMgr", @"CContactMgr"];
+    for (NSString *cn in classes) {
+        Class c = NSClassFromString(cn);
+        [s appendFormat:@"%@ %@\n", c ? @"✅" : @"❌", cn];
+    }
+
+    [s appendString:@"\n=== CMessageMgr selector ===\n"];
+    Class msgMgr = NSClassFromString(@"CMessageMgr");
+    NSArray *sels = @[@"onNewSyncMessage:", @"AsyncOnAddMsg:MsgWrap:",
+                       @"onAddMsg:MsgWrap:", @"AddMsg:MsgWrap:"];
+    for (NSString *sn in sels) {
+        SEL sel = NSSelectorFromString(sn);
+        [s appendFormat:@"%@ %@\n", [msgMgr instancesRespondToSelector:sel] ? @"✅" : @"❌", sn];
+    }
+
+    NSString *ck = quarkd_cookie();
+    [s appendFormat:@"\n=== 状态 ===\nCookie: %@ (%lu chars)\n白名单: %lu人\n",
+     ck.length>0?@"已设置":@"❌未设置", (unsigned long)ck.length, (unsigned long)quarkd_whitelist().count];
+    [s appendFormat:@"\n日志: %@", quarkd_logPath()];
+    return s;
+}
+
+// ── 设置页 hook ──────────────────────────────────────
+
+- (void)quarkd_viewDidLoad {
+    [self quarkd_viewDidLoad];
+    quarkd_log(@"🏠 NewSettingViewController viewDidLoad");
+
+    UINavigationItem *navItem = [self valueForKey:@"navigationItem"];
+    if (navItem) {
+        navItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+            initWithTitle:@"夸克" style:UIBarButtonItemStylePlain
+            target:self action:@selector(quarkd_openSettings)];
+    }
+}
+
+- (void)quarkd_openSettings {
+    Class settingsVC = NSClassFromString(@"QuarkdSettingsVC");
+    if (!settingsVC) { quarkd_log(@"❌ QuarkdSettingsVC not found"); return; }
+    UIViewController *vc = [[settingsVC alloc] init];
+    vc.title = @"夸克助手";
+    UINavigationController *nav = [self valueForKey:@"navigationController"];
+    if (nav) [nav pushViewController:vc animated:YES];
+}
+
+@end
+
+
+// ═══════════════════════════════════════════════════════
+//  设置页面 — QuarkdSettingsVC
+// ═══════════════════════════════════════════════════════
+
+@interface QuarkdSettingsVC : UIViewController
+<UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
+@end
+
+@implementation QuarkdSettingsVC {
+    UITableView *_tableView;
+    NSMutableArray<NSString *> *_whitelist;
+    NSString *_cookieDraft;
+    BOOL _cookieEditing;
+    UITextField *_cookieField;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor groupTableViewBackgroundColor];
+    _whitelist = quarkd_whitelist();
+    _cookieDraft = quarkd_cookie();
+
+    _tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleGrouped];
+    _tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    [self.view addSubview:_tableView];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (_cookieDraft) quarkd_setCookie(_cookieDraft);
+    quarkd_saveWhitelist(_whitelist);
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 3; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 2;
+    if (section == 1) return _whitelist.count + 1;
+    return 2; // 查看日志 + 清空日志
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return @"夸克 Cookie";
+    if (section == 1) return @"授权联系人 (白名单)";
+    return @"调试工具";
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
+    if (section == 0) return @"从夸克网页版 F12 → Application → Cookies → 全选复制";
+    if (section == 1) return @"白名单中的联系人可使用 /s /g /ck /log /debug 命令";
+    return @"查看 dylib 运行日志，排查问题";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *cid = @"cell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+    }
+    cell.textLabel.text = nil;
+    cell.detailTextLabel.text = nil;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessoryView = nil;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+
+    if (ip.section == 0) {
+        if (ip.row == 0) {
+            cell.textLabel.text = @"当前状态";
+            cell.detailTextLabel.text = _cookieDraft.length > 0
+                ? [NSString stringWithFormat:@"已设置 (%lu 字符)", (unsigned long)_cookieDraft.length]
+                : @"❌ 未设置";
+            cell.detailTextLabel.textColor = _cookieDraft.length > 0
+                ? [UIColor colorWithRed:0.2 green:0.7 blue:0.2 alpha:1] : [UIColor redColor];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else {
+            cell.textLabel.text = @"编辑 Cookie";
+            if (_cookieEditing) {
+                if (!_cookieField) {
+                    _cookieField = [[UITextField alloc] initWithFrame:CGRectMake(15, 8, cell.contentView.bounds.size.width - 30, 30)];
+                    _cookieField.placeholder = @"粘贴夸克 Cookie";
+                    _cookieField.text = _cookieDraft;
+                    _cookieField.font = [UIFont systemFontOfSize:13];
+                    _cookieField.autocorrectionType = UITextAutocorrectionTypeNo;
+                    _cookieField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+                    _cookieField.returnKeyType = UIReturnKeyDone;
+                    _cookieField.delegate = self;
+                }
+                [cell.contentView addSubview:_cookieField];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            } else {
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            }
+        }
+    } else if (ip.section == 1) {
+        if (ip.row < (NSInteger)_whitelist.count) {
+            NSString *wxid = _whitelist[ip.row];
+            cell.textLabel.text = [self nickForWxid:wxid];
+            cell.detailTextLabel.text = wxid;
+            cell.detailTextLabel.textColor = [UIColor grayColor];
+        } else {
+            cell.textLabel.text = @"➕ 添加联系人";
+            cell.textLabel.textColor = [UIColor colorWithRed:0 green:0.48 blue:1 alpha:1];
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        }
+    } else {
+        if (ip.row == 0) {
+            cell.textLabel.text = @"📋 查看运行日志";
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            cell.textLabel.text = @"🗑 清空日志文件";
+            cell.textLabel.textColor = [UIColor redColor];
+        }
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 0 && ip.row == 1) {
+        _cookieEditing = !_cookieEditing;
+        [_tableView reloadSections:[NSIndexSet indexSetWithIndex:0] withRowAnimation:UITableViewRowAnimationAutomatic];
+        return;
+    }
+    if (ip.section == 1 && ip.row == (NSInteger)_whitelist.count) {
+        [self showAddContactAlert];
+        return;
+    }
+    if (ip.section == 2) {
+        if (ip.row == 0) [self showLogViewer];
+        else [self showClearLogConfirm];
+        return;
+    }
+}
+
+- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip {
+    return ip.section == 1 && ip.row < (NSInteger)_whitelist.count;
+}
+
+- (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)style forRowAtIndexPath:(NSIndexPath *)ip {
+    if (style == UITableViewCellEditingStyleDelete && ip.section == 1) {
+        [_whitelist removeObjectAtIndex:ip.row];
+        quarkd_saveWhitelist(_whitelist);
+        [_tableView deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationFade];
+    }
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)tf {
+    _cookieDraft = tf.text;
+    _cookieEditing = NO;
+    [_cookieField removeFromSuperview];
+    _cookieField = nil;
+    [_tableView reloadSections:[NSIndexSet indexSetWithIndex:0] withRowAnimation:UITableViewRowAnimationAutomatic];
+    [tf resignFirstResponder];
+    return YES;
+}
+
+// ── 日志查看器 ──────────────────────────────────────
+
+- (void)showLogViewer {
+    NSString *logText = quarkd_readLog(200);
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"运行日志 (最新200行)" message:logText
+        preferredStyle:UIAlertControllerStyleAlert];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        id pb = [objc_getClass("UIPasteboard") performSelector:NSSelectorFromString("generalPasteboard")]; [pb performSelector:NSSelectorFromString("setString:") withObject:logText];
+        [self showToast:@"已复制到剪贴板"];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showClearLogConfirm {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清空日志"
+        message:@"确定清空日志文件?" preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清空" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        [@"" writeToFile:quarkd_logPath() atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        [self showToast:@"日志已清空"];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showToast:(NSString *)msg {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:nil message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:ac animated:YES completion:nil];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [(id)self dismissViewControllerAnimated:YES completion:nil];
+    });
+}
+
+// ── 添加联系人 ──────────────────────────────────────
+
+- (void)showAddContactAlert {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"添加授权联系人"
+        message:@"输入微信号 或 从最近聊天选择"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"👤 手动输入 wxid" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        [self showWxidInput];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"💬 从最近聊天选择" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        [self showRecentContacts];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showWxidInput {
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"输入微信号" message:@"格式: wxid_xxxxxxxx"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"wxid_xxx"; }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"添加" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        NSString *wxid = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (wxid.length > 0 && ![_whitelist containsObject:wxid]) {
+            [_whitelist addObject:wxid];
+            quarkd_saveWhitelist(_whitelist);
+            [_tableView reloadSections:[NSIndexSet indexSetWithIndex:1] withRowAnimation:UITableViewRowAnimationAutomatic];
+        }
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+// ── 从最近聊天获取联系人（多方案兜底） ──────────────
+
+- (NSArray *)_quarkd_getAllSessions {
+    quarkd_log(@"🔍 开始获取会话列表...");
+
+    NSArray *sessions;
+
+    // 方案1: MMSessionMgr.m_arrSessions
+    sessions = [self _quarkd_sessionsVia:@"MMSessionMgr" key:@"m_arrSessions"];
+    if (sessions.count) { quarkd_log(@"✅ 方案1: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案2: MMSessionMgr.getAllSession
+    sessions = [self _quarkd_sessionsViaSelector:@"MMSessionMgr" sel:@"getAllSession"];
+    if (sessions.count) { quarkd_log(@"✅ 方案2: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案3: MMNewSessionMgr.m_arrSessions
+    sessions = [self _quarkd_sessionsVia:@"MMNewSessionMgr" key:@"m_arrSessions"];
+    if (sessions.count) { quarkd_log(@"✅ 方案3: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案4: MMNewSessionMgr.getAllSession
+    sessions = [self _quarkd_sessionsViaSelector:@"MMNewSessionMgr" sel:@"getAllSession"];
+    if (sessions.count) { quarkd_log(@"✅ 方案4: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案5: CContactMgr.m_arrSessionList
+    sessions = [self _quarkd_sessionsVia:@"CContactMgr" key:@"m_arrSessionList"];
+    if (sessions.count) { quarkd_log(@"✅ 方案5: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案6: CContactMgr.getAllContacts
+    sessions = [self _quarkd_sessionsViaSelector:@"CContactMgr" sel:@"getAllContacts"];
+    if (sessions.count) { quarkd_log(@"✅ 方案6: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案7: CContactMgr.m_arrContacts
+    sessions = [self _quarkd_sessionsVia:@"CContactMgr" key:@"m_arrContacts"];
+    if (sessions.count) { quarkd_log(@"✅ 方案7: %lu", (unsigned long)sessions.count); return sessions; }
+
+    // 方案8: MMSessionMgr.m_arrSessionInfos
+    sessions = [self _quarkd_sessionsVia:@"MMSessionMgr" key:@"m_arrSessionInfos"];
+    if (sessions.count) { quarkd_log(@"✅ 方案8: %lu", (unsigned long)sessions.count); return sessions; }
+
+    quarkd_log(@"❌ 所有方案均失败");
+    return nil;
+}
+
+- (NSArray *)_quarkd_sessionsVia:(NSString *)className key:(NSString *)key {
+    @try {
+        Class center = NSClassFromString(@"MMServiceCenter");
+        Class cls = NSClassFromString(className);
+        if (!center || !cls) return nil;
+
+        id mgr = [[center defaultCenter] performSelector:NSSelectorFromString(@"getService:") withObject:cls];
+        if (!mgr) {
+            quarkd_log(@"  getService:%@ = nil", className);
+            return nil;
+        }
+
+        id val = [mgr valueForKey:key];
+        if ([val isKindOfClass:[NSArray class]]) return val;
+        quarkd_log(@"  %@.%@ type=%@ (not NSArray)", className, key, [val class]);
+    } @catch (NSException *e) {
+        quarkd_log(@"  %@.%@ exception: %@", className, key, e);
+    }
+    return nil;
+}
+
+- (NSArray *)_quarkd_sessionsViaSelector:(NSString *)className sel:(NSString *)selName {
+    @try {
+        Class center = NSClassFromString(@"MMServiceCenter");
+        Class cls = NSClassFromString(className);
+        if (!center || !cls) return nil;
+
+        id mgr = [[center defaultCenter] performSelector:NSSelectorFromString(@"getService:") withObject:cls];
+        if (!mgr) return nil;
+
+        SEL sel = NSSelectorFromString(selName);
+        if (![mgr respondsToSelector:sel]) {
+            quarkd_log(@"  %@ does NOT respond to %@", className, selName);
+            return nil;
+        }
+
+        id val = [mgr performSelector:sel];
+        if ([val isKindOfClass:[NSArray class]]) return val;
+        quarkd_log(@"  %@.%@ result type=%@", className, selName, [val class]);
+    } @catch (NSException *e) {
+        quarkd_log(@"  %@.%@ exception: %@", className, selName, e);
+    }
+    return nil;
+}
+
+- (void)showRecentContacts {
+    quarkd_log(@"📇 用户点击'从最近聊天选择'");
+
+    NSArray *sessions = [self _quarkd_getAllSessions];
+
+    if (!sessions || sessions.count == 0) {
+        quarkd_log(@"❌ 无法获取会话列表");
+        NSString *dbg = quarkd_readLog(20);
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"⚠️ 无法获取联系人"
+            message:[NSString stringWithFormat:@"请手动输入 wxid\n\n调试日志:\n%@", dbg]
+            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"手动输入" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+            [self showWxidInput];
+        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    quarkd_log(@"📇 获取到 %lu 个会话", (unsigned long)sessions.count);
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"选择联系人 (点击添加)"
+        message:[NSString stringWithFormat:@"共 %lu 个会话", (unsigned long)sessions.count]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSInteger added = 0;
+    NSInteger max = MIN(sessions.count, 50);
+    for (NSInteger i = 0; i < max; i++) {
+        id contact = sessions[i];
+
+        // 多属性尝试取 wxid
+        NSString *wxid = [contact valueForKey:@"m_nsUsrName"];
+        if (!wxid) wxid = [contact valueForKey:@"m_nsUserName"];
+        if (!wxid) wxid = [contact valueForKey:@"userName"];
+        if (!wxid) wxid = [contact valueForKey:@"m_nsFromUsr"];
+        if (!wxid) continue;
+
+        if ([_whitelist containsObject:wxid]) continue;
+
+        NSString *nick = [contact valueForKey:@"m_nsNickName"];
+        if (!nick) nick = [contact valueForKey:@"nickName"];
+        if (!nick) nick = [contact valueForKey:@"m_nsTitle"];
+
+        NSString *label = nick.length > 0 ? [NSString stringWithFormat:@"%@ (%@)", nick, wxid] : wxid;
+
+        [ac addAction:[UIAlertAction actionWithTitle:label style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+            [_whitelist addObject:wxid];
+            quarkd_saveWhitelist(_whitelist);
+            quarkd_log(@"✅ 添加联系人: %@", wxid);
+            [_tableView reloadSections:[NSIndexSet indexSetWithIndex:1] withRowAnimation:UITableViewRowAnimationAutomatic];
+        }]];
+        added++;
+    }
+
+    if (added == 0) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"所有联系人已添加" style:UIAlertActionStyleDefault handler:nil]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (NSString *)nickForWxid:(NSString *)wxid {
+    @try {
+        Class center = NSClassFromString(@"MMServiceCenter");
+        Class mgrCls = NSClassFromString(@"CContactMgr");
+        if (!center || !mgrCls) return wxid;
+        id mgr = [[center defaultCenter] performSelector:NSSelectorFromString(@"getService:") withObject:mgrCls];
+        if (!mgr) return wxid;
+
+        SEL sel = NSSelectorFromString(@"getContactByName:");
+        if (![mgr respondsToSelector:sel]) return wxid;
+
+        id contact = [mgr performSelector:sel withObject:wxid];
+        NSString *nick = [contact valueForKey:@"m_nsNickName"];
+        if (nick.length > 0) return nick;
+        nick = [contact valueForKey:@"nickName"];
+        if (nick.length > 0) return nick;
+    } @catch (...) {}
+    return wxid;
+}
+
+@end
+
+
+// ═══════════════════════════════════════════════════════
+//  __attribute__((constructor)) — dylib 加载入口
+// ═══════════════════════════════════════════════════════
+
+__attribute__((constructor))
+static void quarkd_init(void) {
+    quarkd_log(@"========== dylib 已加载 ==========");
+    quarkd_log(@"日志路径: %@", quarkd_logPath());
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        Class msgMgr = NSClassFromString(@"CMessageMgr");
+        if (msgMgr) {
+            SEL hook = NSSelectorFromString(@"quarkd_onNewSyncMessage:");
+
+            // 列出消息相关的 methods
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(msgMgr, &count);
+            NSMutableArray *selNames = [NSMutableArray array];
+            for (unsigned int i = 0; i < count; i++) {
+                NSString *name = NSStringFromSelector(method_getName(methods[i]));
+                if ([name containsString:@"Msg"] || [name containsString:@"msg"] ||
+                    [name containsString:@"Sync"] || [name containsString:@"Add"]) {
+                    [selNames addObject:name];
+                }
+            }
+            free(methods);
+            quarkd_log(@"CMessageMgr 消息相关 methods: %@", selNames);
+
+            // 按优先级尝试 hook
+            NSArray *sels = @[
+                @"onNewSyncMessage:",
+                @"AsyncOnAddMsg:MsgWrap:",
+                @"onAddMsg:MsgWrap:",
+                @"AddMsg:MsgWrap:",
+            ];
+
+            BOOL hooked = NO;
+            for (NSString *s in sels) {
+                SEL orig = NSSelectorFromString(s);
+                if ([msgMgr instancesRespondToSelector:orig]) {
+                    swizzleOrAdd(msgMgr, orig, hook);
+                    hooked = YES;
+                    break;
+                }
+            }
+
+            if (!hooked) {
+                // 自动发现：找 on* 开头且参数数为1的方法
+                quarkd_log(@"⚠️ 标准 hook 点均未找到，尝试自动发现...");
+                unsigned int mc = 0;
+                Method *ms = class_copyMethodList(msgMgr, &mc);
+                for (unsigned int i = 0; i < mc && !hooked; i++) {
+                    const char *nm = sel_getName(method_getName(ms[i]));
+                    if (strncmp(nm, "on", 2) == 0) {
+                        unsigned int argCount = 0;
+                        for (const char *p = method_getTypeEncoding(ms[i]); *p; p++) {
+                            if (*p == ':') argCount++;
+                        }
+                        if (argCount == 1) {
+                            quarkd_log(@"🔍 尝试 hook: %@ (argc=%u)", NSStringFromSelector(method_getName(ms[i])), argCount);
+                            swizzleOrAdd(msgMgr, method_getName(ms[i]), hook);
+                            hooked = YES;
+                        }
+                    }
+                }
+                free(ms);
+            }
+        } else {
+            quarkd_log(@"❌ CMessageMgr class not found!");
+        }
+
+        Class settingVC = NSClassFromString(@"NewSettingViewController");
+        if (settingVC) {
+            swizzleOrAdd(settingVC,
+                         NSSelectorFromString(@"viewDidLoad"),
+                         NSSelectorFromString(@"quarkd_viewDidLoad"));
+        } else {
+            quarkd_log(@"❌ NewSettingViewController not found");
+        }
+
+        quarkd_log(@"========== hooks 安装完成 ==========");
+    });
+}

@@ -1,0 +1,9 @@
+Package: com.quarkd.tweak
+Name: 夸克搜索助手
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 微信内搜索夸克网盘资源，一键转存分享
+Maintainer: quarkd
+Author: quarkd
+Section: Tweaks
+Depends: mobilesubstrate
