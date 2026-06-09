@@ -8,10 +8,17 @@
       "content": "你好",
       "timestamp": 1780993898275,
       "attachedContexts": []
+    },
+    {
+      "id": "7444534f-3a4c-4ef3-b9e2-914914082964",
+      "role": "user",
+      "content": "你好",
+      "timestamp": 1780993909599,
+      "attachedContexts": []
     }
   ],
   "createdAt": 1780993894413,
-  "updatedAt": 1780993898276,
+  "updatedAt": 1780993909599,
   "repoOwner": "Cheng-liping",
   "repoName": "Linyi-github",
   "branch": "main",
